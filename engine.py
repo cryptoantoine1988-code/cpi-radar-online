@@ -6,17 +6,87 @@ import requests
 
 SERIES = ('CPIAUCSL', 'CPILFESL', 'GASREGW', 'DGS10', 'DFF')
 
-def fetch_fred(series, timeout=25):
-    url = f'https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}'
-    r = requests.get(url, timeout=timeout, headers={'User-Agent': 'CPI-Radar/1.0 research dashboard'})
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [str(c).strip() for c in df.columns]
-    date_col = 'observation_date' if 'observation_date' in df else 'DATE'
-    if date_col not in df or series not in df:
-        raise ValueError(f'Format FRED inattendu pour {series}')
-    out = pd.Series(pd.to_numeric(df[series].replace('.', np.nan), errors='coerce').to_numpy(), index=pd.to_datetime(df[date_col]), name=series)
-    return out.dropna().sort_index()
+
+def fetch_fred(series, timeout=12):
+    """Télécharge une série FRED avec tentatives et source de secours."""
+    import time
+
+    urls = [
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}",
+        f"https://api.db.nomics.world/v22/series/FRED/{series}?observations=1",
+    ]
+
+    errors = []
+
+    for url in urls:
+        for attempt in range(2):
+            try:
+                response = requests.get(
+                    url,
+                    timeout=(6, timeout),
+                    headers={
+                        "User-Agent": "Mozilla/5.0 CPI-Radar/1.1"
+                    },
+                )
+                response.raise_for_status()
+
+                if "db.nomics.world" in url:
+                    payload = response.json()
+                    docs = payload["series"]["docs"]
+                    if not docs:
+                        raise ValueError("Série absente de DBnomics")
+
+                    doc = docs[0]
+                    dates = doc["period"]
+                    values = doc["value"]
+
+                    out = pd.Series(
+                        pd.to_numeric(
+                            pd.Series(values).replace("NA", np.nan),
+                            errors="coerce",
+                        ).to_numpy(),
+                        index=pd.to_datetime(dates),
+                        name=series,
+                    )
+                else:
+                    df = pd.read_csv(io.StringIO(response.text))
+                    df.columns = [str(c).strip() for c in df.columns]
+
+                    date_col = (
+                        "observation_date"
+                        if "observation_date" in df.columns
+                        else "DATE"
+                    )
+
+                    if date_col not in df.columns or series not in df.columns:
+                        raise ValueError("Format CSV FRED inattendu")
+
+                    out = pd.Series(
+                        pd.to_numeric(
+                            df[series].replace(".", np.nan),
+                            errors="coerce",
+                        ).to_numpy(),
+                        index=pd.to_datetime(df[date_col]),
+                        name=series,
+                    )
+
+                out = out.dropna().sort_index()
+
+                if len(out) < 24:
+                    raise ValueError("Historique insuffisant")
+
+                return out
+
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+                if attempt == 0:
+                    time.sleep(1)
+
+    raise RuntimeError(
+        f"Impossible de récupérer {series}. "
+        + " | ".join(errors)
+    )
+
 
 def load_data():
     raw = {}
